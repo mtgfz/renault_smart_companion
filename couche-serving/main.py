@@ -1,17 +1,6 @@
-"""
+﻿"""
 Renault Smart Companion — Concessionnaire
 API backend (FastAPI) — connectée à PostgreSQL.
-
-Prérequis :
-    1. PostgreSQL doit tourner et le schéma appliqué :
-       psql -h localhost -U rsc_user -d renault_smart_companion -f ../data-pipeline/schema.sql
-    2. Copier .env.example en .env et ajuster DATABASE_URL si besoin.
-
-Lancer :
-    pip install -r requirements.txt
-    uvicorn main:app --reload --port 8000
-
-Puis ouvrir : http://localhost:8000/docs
 """
 
 from fastapi import FastAPI, HTTPException, Depends
@@ -20,6 +9,7 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from database import get_db
 
@@ -37,9 +27,6 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Modèles de données (Pydantic) — ce que l'API accepte en entrée
-# ---------------------------------------------------------------------------
 class ClientIn(BaseModel):
     nom: str
     prenom: str
@@ -47,6 +34,8 @@ class ClientIn(BaseModel):
     telephone: Optional[str] = None
     ville: Optional[str] = None
     source: Optional[str] = "site_web"
+    canal: Optional[str] = None
+    campagne: Optional[str] = None
 
 
 class LeadIn(BaseModel):
@@ -55,29 +44,29 @@ class LeadIn(BaseModel):
     notes: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)):
-    """Vérifie que l'API ET la base de données répondent."""
     db.execute(text("SELECT 1"))
     return {"status": "ok", "service": "renault-smart-companion-api", "database": "connected"}
 
 
 @app.post("/clients", status_code=201)
 def create_client(client: ClientIn, db: Session = Depends(get_db)):
-    result = db.execute(
-        text("""
-            INSERT INTO clients (nom, prenom, email, telephone, ville, source)
-            VALUES (:nom, :prenom, :email, :telephone, :ville, :source)
-            RETURNING id, nom, prenom, email, telephone, ville, source, created_at
-        """),
-        client.dict(),
-    )
-    db.commit()
-    row = result.mappings().first()
-    return dict(row)
+    try:
+        result = db.execute(
+            text("""
+                INSERT INTO clients (nom, prenom, email, telephone, ville, source, canal, campagne)
+                VALUES (:nom, :prenom, :email, :telephone, :ville, :source, :canal, :campagne)
+                RETURNING id, nom, prenom, email, telephone, ville, source, canal, campagne, created_at
+            """),
+            client.dict(),
+        )
+        db.commit()
+        row = result.mappings().first()
+        return dict(row)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Un client avec cet email existe déjà.")
 
 
 @app.get("/clients")
@@ -152,4 +141,26 @@ def get_kpis(db: Session = Depends(get_db)):
         "total_clients": total_clients,
         "total_leads": total_leads,
         "leads_par_statut": {row["statut"]: row["total"] for row in par_statut},
+    }
+
+
+@app.get("/kpis/par-canal")
+def get_kpis_par_canal(db: Session = Depends(get_db)):
+    """Répartition des clients par source/canal/campagne — pour évaluer le ROI publicitaire."""
+    par_source = db.execute(
+        text("SELECT source, COUNT(*) as total FROM clients WHERE source IS NOT NULL GROUP BY source ORDER BY total DESC")
+    ).mappings().all()
+
+    par_canal = db.execute(
+        text("SELECT canal, COUNT(*) as total FROM clients WHERE canal IS NOT NULL GROUP BY canal ORDER BY total DESC")
+    ).mappings().all()
+
+    par_campagne = db.execute(
+        text("SELECT campagne, COUNT(*) as total FROM clients WHERE campagne IS NOT NULL GROUP BY campagne ORDER BY total DESC")
+    ).mappings().all()
+
+    return {
+        "par_source": {row["source"]: row["total"] for row in par_source},
+        "par_canal": {row["canal"]: row["total"] for row in par_canal},
+        "par_campagne": {row["campagne"]: row["total"] for row in par_campagne},
     }
